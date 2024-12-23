@@ -4,3 +4,7 @@ torch
 edge-tts
 faster-whisper
 groq
+streamlit-webrtc
+av
+soundfile
+
