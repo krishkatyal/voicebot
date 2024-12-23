@@ -7,11 +7,11 @@ import edge_tts
 from typing import List
 from faster_whisper import WhisperModel
 import groq
-import av
 import numpy as np
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
-from queue import Queue
 import threading
+import wave
+import io
 
 # Configure page
 st.set_page_config(
@@ -24,16 +24,20 @@ st.set_page_config(
 # Styling
 st.markdown("""
     <style>
-    /* Modern color scheme */
+    /* Dark theme */
     :root {
+        --background-color: #000000;
+        --text-color: #FFFFFF;
         --primary-color: #4C61F0;
-        --background-color: #FFFFFF;
-        --text-color: #333333;
+    }
+    
+    body {
+        background-color: var(--background-color);
+        color: var(--text-color);
     }
     
     .stApp {
         background-color: var(--background-color);
-        color: var(--text-color);
     }
     
     /* Chat messages */
@@ -41,16 +45,16 @@ st.markdown("""
         padding: 1rem;
         border-radius: 15px;
         margin: 0.5rem 0;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        box-shadow: 0 2px 8px rgba(255,255,255,0.1);
     }
     
     .user-message {
-        background: #E3F2FD;
+        background: #1E1E1E;
         border-left: 4px solid var(--primary-color);
     }
     
     .assistant-message {
-        background: #F3E5F5;
+        background: #2E2E2E;
         border-left: 4px solid #9C27B0;
     }
     
@@ -59,16 +63,18 @@ st.markdown("""
         display: flex;
         align-items: center;
         gap: 10px;
-        background: white;
+        background: #1E1E1E;
         padding: 10px;
         border-radius: 15px;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        box-shadow: 0 2px 8px rgba(255,255,255,0.1);
         margin-top: 1rem;
     }
     
     .stTextInput > div > div > input {
+        background-color: #2E2E2E;
+        color: var(--text-color);
         border-radius: 12px;
-        border: 2px solid #E9ECEF;
+        border: 2px solid #4E4E4E;
         padding: 0.5rem;
         font-size: 1rem;
     }
@@ -81,7 +87,7 @@ st.markdown("""
     /* Streamlit elements */
     .stButton>button {
         background-color: var(--primary-color);
-        color: white;
+        color: var(--text-color);
         border-radius: 20px;
         padding: 0.5rem 1rem;
         border: none;
@@ -90,12 +96,17 @@ st.markdown("""
     
     .stButton>button:hover {
         background-color: #3D4EBF;
-        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        box-shadow: 0 4px 8px rgba(255,255,255,0.1);
     }
     
     /* Hide Streamlit branding */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
+
+    /* Override default Streamlit styling */
+    .stApp, .main, .element-container, p, h1, h2, h3 {
+        color: var(--text-color) !important;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -103,7 +114,7 @@ st.markdown("""
 if 'history' not in st.session_state:
     st.session_state.history = []
 if 'audio_buffer' not in st.session_state:
-    st.session_state.audio_buffer = Queue()
+    st.session_state.audio_buffer = []
 
 # Initialize clients with provided keys
 @st.cache_resource
@@ -161,12 +172,19 @@ def transcribe_audio(audio_data: np.ndarray) -> str:
         return ""
         
     try:
-        # Save audio data to a temporary file
+        # Convert audio data to WAV format
+        with io.BytesIO() as wav_buffer:
+            with wave.open(wav_buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(16000)
+                wav_file.writeframes(audio_data.tobytes())
+            wav_data = wav_buffer.getvalue()
+
+        # Save WAV data to a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
             temp_path = temp_file.name
-            audio_data = (audio_data * 32767).astype(np.int16)
-            import soundfile as sf
-            sf.write(temp_path, audio_data, samplerate=16000)
+            temp_file.write(wav_data)
 
         segments, _ = whisper_model.transcribe(
             temp_path,
@@ -198,14 +216,12 @@ def get_assistant_response(messages: List[dict]) -> str:
         return f"Error: {str(e)}"
 
 def process_audio():
-    while True:
-        if not st.session_state.audio_buffer.empty():
-            audio_data = st.session_state.audio_buffer.get()
-            text_input = transcribe_audio(audio_data)
-            if text_input:
-                process_response(text_input)
-        else:
-            break
+    if len(st.session_state.audio_buffer) > 0:
+        audio_data = np.concatenate(st.session_state.audio_buffer)
+        text_input = transcribe_audio(audio_data)
+        if text_input:
+            process_response(text_input)
+        st.session_state.audio_buffer = []
 
 def process_response(text_input: str):
     if not text_input:
@@ -233,7 +249,7 @@ def process_response(text_input: str):
 def audio_frame_callback(frame):
     sound = frame.to_ndarray()
     sound = sound.mean(axis=1)
-    st.session_state.audio_buffer.put(sound)
+    st.session_state.audio_buffer.append(sound)
 
 # Initialize components
 if 'audio_player' not in st.session_state:
@@ -269,7 +285,9 @@ if webrtc_ctx.audio_receiver:
     if sound_chunk:
         for audio_frame in sound_chunk:
             audio_frame_callback(audio_frame)
-        threading.Thread(target=process_audio, daemon=True).start()
+    
+    if st.button("Process Audio"):
+        process_audio()
 
 # Text input
 text_input = st.text_input("Or type your message here:", key="text_input")
