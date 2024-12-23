@@ -1,18 +1,15 @@
 import streamlit as st
-import sounddevice as sd
-import numpy as np
-import wave
 import torch
 import os
 import tempfile
-import threading
 import time
 import asyncio
 import edge_tts
 from typing import List
 from faster_whisper import WhisperModel
 import groq
-import pygame
+import base64
+from datetime import datetime, timedelta
 
 # Configure page
 st.set_page_config(
@@ -22,7 +19,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Styling (same as original)
+# Styling (unchanged)
 st.markdown("""
     <style>
     /* Modern color scheme */
@@ -108,24 +105,12 @@ st.markdown("""
 # Initialize session state
 if 'history' not in st.session_state:
     st.session_state.history = []
-if 'recording' not in st.session_state:
-    st.session_state.recording = False
-if 'audio_playing' not in st.session_state:
-    st.session_state.audio_playing = False
 if 'processed_text' not in st.session_state:
     st.session_state.processed_text = None
-
-def initialize_audio():
-    try:
-        pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=512)
-    except pygame.error:
-        try:
-            pygame.mixer.init()
-        except pygame.error:
-            st.warning("⚠️ Audio output might not work properly on this system.")
-
-# Initialize audio
-initialize_audio()
+if 'recording' not in st.session_state:
+    st.session_state.recording = False
+if 'record_start_time' not in st.session_state:
+    st.session_state.record_start_time = None
 
 # Initialize clients with provided keys
 @st.cache_resource
@@ -153,23 +138,7 @@ groq_client, whisper_model = initialize_clients()
 
 class OptimizedAudioPlayer:
     def __init__(self):
-        self._stop_event = threading.Event()
         self.VOICE = "en-US-JennyNeural"
-        self.audio_enabled = True
-        
-        try:
-            pygame.mixer.get_init()
-        except:
-            self.audio_enabled = False
-            st.warning("⚠️ Audio playback is not available on this system.")
-    
-    def stop(self):
-        if self.audio_enabled:
-            self._stop_event.set()
-            try:
-                pygame.mixer.music.stop()
-            except:
-                pass
     
     async def _generate_speech(self, text: str, output_file: str):
         communicate = edge_tts.Communicate(text, self.VOICE)
@@ -178,75 +147,29 @@ class OptimizedAudioPlayer:
     def play(self, text: str):
         if not text:
             return
-            
-        if not self.audio_enabled:
-            st.warning("⚠️ Audio playback is not available. Displaying text only.")
-            st.write(text)
-            return
-            
-        self._stop_event.clear()
+        
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as temp_file:
                 temp_path = temp_file.name
             
             asyncio.run(self._generate_speech(text, temp_path))
             
-            try:
-                pygame.mixer.music.load(temp_path)
-                pygame.mixer.music.play()
-                
-                while pygame.mixer.music.get_busy():
-                    if self._stop_event.is_set():
-                        pygame.mixer.music.stop()
-                        break
-                    time.sleep(0.1)
-            except Exception as e:
-                st.error(f"Playback error: {str(e)}")
-                st.write(text)
+            # Read the audio file and encode it to base64
+            with open(temp_path, "rb") as audio_file:
+                audio_bytes = audio_file.read()
+            audio_base64 = base64.b64encode(audio_bytes).decode()
+            
+            # Display audio player in Streamlit
+            st.audio(audio_base64, format='audio/mp3')
             
             os.unlink(temp_path)
             
         except Exception as e:
             st.error(f"🔇 Audio generation error: {str(e)}")
             st.write(text)
-        finally:
-            st.session_state.audio_playing = False
-
-class OptimizedAudioRecorder:
-    def __init__(self):
-        self.stream = None
-        self.frames = []
-        self.is_recording = False
-
-    def start_recording(self):
-        self.frames = []
-        self.is_recording = True
-        self.stream = sd.InputStream(samplerate=16000, channels=1, callback=self.callback)
-        self.stream.start()
-
-    def stop_recording(self):
-        if not self.stream:
-            return None
-            
-        self.is_recording = False
-        self.stream.stop()
-        self.stream.close()
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as f:
-            wf = wave.open(f.name, 'wb')
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit audio
-            wf.setframerate(16000)
-            wf.writeframes(b''.join(self.frames))
-            wf.close()
-            return f.name
-
-    def callback(self, indata, frames, time, status):
-        if self.is_recording:
-            self.frames.append(indata.copy())
 
 @st.cache_data(ttl=300)
-def transcribe_audio(audio_file: str) -> str:
+def transcribe_audio(audio_file) -> str:
     if not audio_file or not whisper_model:
         return ""
         
@@ -279,7 +202,7 @@ def get_assistant_response(messages: List[dict]) -> str:
         st.error(f"Groq API Error: {str(e)}")
         return f"Error: {str(e)}"
 
-def process_response(text_input: str, is_voice: bool = False):
+def process_response(text_input: str):
     if not text_input:
         return
         
@@ -297,19 +220,11 @@ def process_response(text_input: str, is_voice: bool = False):
             
         st.session_state.history.append({"role": "assistant", "content": response})
         
-        st.session_state.audio_playing = True
-        player_thread = threading.Thread(
-            target=st.session_state.audio_player.play,
-            args=(response,),
-            daemon=True
-        )
-        player_thread.start()
+        st.session_state.audio_player.play(response)
     except Exception as e:
         st.error(f"Error processing response: {str(e)}")
 
 # Initialize components
-if 'audio_recorder' not in st.session_state:
-    st.session_state.audio_recorder = OptimizedAudioRecorder()
 if 'audio_player' not in st.session_state:
     st.session_state.audio_player = OptimizedAudioPlayer()
 
@@ -329,7 +244,7 @@ with chat_container:
         )
 
 # Input area
-col1, col2 = st.columns([6, 1])
+col1, col2, col3 = st.columns([5, 1, 1])
 
 with col1:
     text_input = st.text_input(
@@ -346,16 +261,19 @@ with col2:
     if st.button(record_icon, key="record_button"):
         if not st.session_state.recording:
             st.session_state.recording = True
-            st.session_state.audio_recorder.start_recording()
+            st.session_state.record_start_time = datetime.now()
         else:
             st.session_state.recording = False
-            with st.spinner("Processing..."):
-                audio_file = st.session_state.audio_recorder.stop_recording()
-                if audio_file:
-                    user_text = transcribe_audio(audio_file)
-                    if user_text:
-                        process_response(user_text, is_voice=True)
-            st.rerun()
+            st.session_state.record_start_time = None
+        st.rerun()
+
+with col3:
+    uploaded_file = st.file_uploader("Upload Audio", type=['wav', 'mp3'], key="audio_upload")
+
+# Display recording timer
+if st.session_state.recording:
+    elapsed_time = datetime.now() - st.session_state.record_start_time
+    st.write(f"Recording: {elapsed_time.seconds}.{elapsed_time.microseconds // 100000:01d}s")
 
 # Handle text input
 if text_input and text_input != st.session_state.processed_text:
@@ -363,10 +281,29 @@ if text_input and text_input != st.session_state.processed_text:
     process_response(text_input)
     st.rerun()
 
+# Handle audio file upload
+if uploaded_file is not None:
+    with st.spinner("Transcribing audio..."):
+        # Save the uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+            temp_file.write(uploaded_file.getvalue())
+            temp_file_path = temp_file.name
+
+        # Transcribe the audio
+        transcription = transcribe_audio(temp_file_path)
+
+        # Remove the temporary file
+        os.unlink(temp_file_path)
+
+        if transcription:
+            st.write("Transcription:", transcription)
+            process_response(transcription)
+            st.rerun()
+        else:
+            st.error("Failed to transcribe the audio. Please try again.")
+
 # Clear chat button
 if st.button("🗑️ Clear Chat", key="clear", help="Clear all messages"):
-    if st.session_state.audio_playing:
-        st.session_state.audio_player.stop()
     st.session_state.history = []
     st.session_state.processed_text = None
     st.rerun()
