@@ -1,0 +1,9 @@
+streamlit
+sounddevice
+numpy
+torch
+edge-tts
+faster-whisper
+groq
+pygame
+
