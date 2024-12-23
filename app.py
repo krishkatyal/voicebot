@@ -2,14 +2,16 @@ import streamlit as st
 import torch
 import os
 import tempfile
-import time
 import asyncio
 import edge_tts
 from typing import List
 from faster_whisper import WhisperModel
 import groq
-import base64
-from datetime import datetime, timedelta
+import av
+import numpy as np
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+from queue import Queue
+import threading
 
 # Configure page
 st.set_page_config(
@@ -19,36 +21,37 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Styling (unchanged)
+# Styling
 st.markdown("""
     <style>
     /* Modern color scheme */
     :root {
         --primary-color: #4C61F0;
         --background-color: #FFFFFF;
+        --text-color: #333333;
     }
     
     .stApp {
-        background-color: #F8F9FA;
+        background-color: var(--background-color);
+        color: var(--text-color);
     }
     
     /* Chat messages */
-    .user-message {
-        background: white;
+    .user-message, .assistant-message {
         padding: 1rem;
         border-radius: 15px;
         margin: 0.5rem 0;
         box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-        border-left: 4px solid #4C61F0;
+    }
+    
+    .user-message {
+        background: #E3F2FD;
+        border-left: 4px solid var(--primary-color);
     }
     
     .assistant-message {
-        background: #F8F9FA;
-        padding: 1rem;
-        border-radius: 15px;
-        margin: 0.5rem 0;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-        border-left: 4px solid #88C0D0;
+        background: #F3E5F5;
+        border-left: 4px solid #9C27B0;
     }
     
     /* Input area styling */
@@ -57,7 +60,7 @@ st.markdown("""
         align-items: center;
         gap: 10px;
         background: white;
-        padding: 5px;
+        padding: 10px;
         border-radius: 15px;
         box-shadow: 0 2px 8px rgba(0,0,0,0.05);
         margin-top: 1rem;
@@ -70,30 +73,24 @@ st.markdown("""
         font-size: 1rem;
     }
     
-    /* Recording button */
-    .record-button {
-        background: none;
+    /* Audio elements */
+    .stAudio {
+        margin-top: 1rem;
+    }
+    
+    /* Streamlit elements */
+    .stButton>button {
+        background-color: var(--primary-color);
+        color: white;
+        border-radius: 20px;
+        padding: 0.5rem 1rem;
         border: none;
-        color: #4C61F0;
-        cursor: pointer;
-        padding: 8px;
-        border-radius: 50%;
         transition: all 0.3s ease;
     }
     
-    .record-button:hover {
-        background: rgba(76, 97, 240, 0.1);
-    }
-    
-    .recording {
-        color: #FF4B4B !important;
-        animation: pulse 1.5s infinite;
-    }
-    
-    @keyframes pulse {
-        0% { transform: scale(1); }
-        50% { transform: scale(1.1); }
-        100% { transform: scale(1); }
+    .stButton>button:hover {
+        background-color: #3D4EBF;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
     }
     
     /* Hide Streamlit branding */
@@ -105,12 +102,8 @@ st.markdown("""
 # Initialize session state
 if 'history' not in st.session_state:
     st.session_state.history = []
-if 'processed_text' not in st.session_state:
-    st.session_state.processed_text = None
-if 'recording' not in st.session_state:
-    st.session_state.recording = False
-if 'record_start_time' not in st.session_state:
-    st.session_state.record_start_time = None
+if 'audio_buffer' not in st.session_state:
+    st.session_state.audio_buffer = Queue()
 
 # Initialize clients with provided keys
 @st.cache_resource
@@ -154,13 +147,8 @@ class OptimizedAudioPlayer:
             
             asyncio.run(self._generate_speech(text, temp_path))
             
-            # Read the audio file and encode it to base64
-            with open(temp_path, "rb") as audio_file:
-                audio_bytes = audio_file.read()
-            audio_base64 = base64.b64encode(audio_bytes).decode()
-            
             # Display audio player in Streamlit
-            st.audio(audio_base64, format='audio/mp3')
+            st.audio(temp_path, format='audio/mp3')
             
             os.unlink(temp_path)
             
@@ -168,19 +156,26 @@ class OptimizedAudioPlayer:
             st.error(f"🔇 Audio generation error: {str(e)}")
             st.write(text)
 
-@st.cache_data(ttl=300)
-def transcribe_audio(audio_file) -> str:
-    if not audio_file or not whisper_model:
+def transcribe_audio(audio_data: np.ndarray) -> str:
+    if audio_data.size == 0 or not whisper_model:
         return ""
         
     try:
+        # Save audio data to a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+            temp_path = temp_file.name
+            audio_data = (audio_data * 32767).astype(np.int16)
+            import soundfile as sf
+            sf.write(temp_path, audio_data, samplerate=16000)
+
         segments, _ = whisper_model.transcribe(
-            audio_file,
+            temp_path,
             beam_size=1,
             word_timestamps=False,
             language='en',
             vad_filter=True
         )
+        os.unlink(temp_path)
         return " ".join(segment.text for segment in segments)
     except Exception as e:
         st.error(f"Transcription error: {str(e)}")
@@ -201,6 +196,16 @@ def get_assistant_response(messages: List[dict]) -> str:
     except Exception as e:
         st.error(f"Groq API Error: {str(e)}")
         return f"Error: {str(e)}"
+
+def process_audio():
+    while True:
+        if not st.session_state.audio_buffer.empty():
+            audio_data = st.session_state.audio_buffer.get()
+            text_input = transcribe_audio(audio_data)
+            if text_input:
+                process_response(text_input)
+        else:
+            break
 
 def process_response(text_input: str):
     if not text_input:
@@ -224,6 +229,12 @@ def process_response(text_input: str):
     except Exception as e:
         st.error(f"Error processing response: {str(e)}")
 
+# Audio processing callback
+def audio_frame_callback(frame):
+    sound = frame.to_ndarray()
+    sound = sound.mean(axis=1)
+    st.session_state.audio_buffer.put(sound)
+
 # Initialize components
 if 'audio_player' not in st.session_state:
     st.session_state.audio_player = OptimizedAudioPlayer()
@@ -243,68 +254,33 @@ with chat_container:
             unsafe_allow_html=True
         )
 
-# Input area
-col1, col2, col3 = st.columns([5, 1, 1])
+# Audio input
+st.write("Click 'Start' to begin recording. Click 'Stop' when you're done speaking.")
+webrtc_ctx = webrtc_streamer(
+    key="speech-to-text",
+    mode=WebRtcMode.SENDONLY,
+    audio_receiver_size=1024,
+    rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
+    media_stream_constraints={"video": False, "audio": True},
+)
 
-with col1:
-    text_input = st.text_input(
-        "",
-        placeholder="Type your message here...",
-        key="text_input",
-        label_visibility="collapsed"
-    )
+if webrtc_ctx.audio_receiver:
+    sound_chunk = webrtc_ctx.audio_receiver.get_frames()
+    if sound_chunk:
+        for audio_frame in sound_chunk:
+            audio_frame_callback(audio_frame)
+        threading.Thread(target=process_audio, daemon=True).start()
 
-with col2:
-    record_button_class = "record-button recording" if st.session_state.recording else "record-button"
-    record_icon = "⏺️" if not st.session_state.recording else "⏹️"
-    
-    if st.button(record_icon, key="record_button"):
-        if not st.session_state.recording:
-            st.session_state.recording = True
-            st.session_state.record_start_time = datetime.now()
-        else:
-            st.session_state.recording = False
-            st.session_state.record_start_time = None
-        st.rerun()
-
-with col3:
-    uploaded_file = st.file_uploader("Upload Audio", type=['wav', 'mp3'], key="audio_upload")
-
-# Display recording timer
-if st.session_state.recording:
-    elapsed_time = datetime.now() - st.session_state.record_start_time
-    st.write(f"Recording: {elapsed_time.seconds}.{elapsed_time.microseconds // 100000:01d}s")
+# Text input
+text_input = st.text_input("Or type your message here:", key="text_input")
 
 # Handle text input
-if text_input and text_input != st.session_state.processed_text:
-    st.session_state.processed_text = text_input
+if text_input:
     process_response(text_input)
-    st.rerun()
-
-# Handle audio file upload
-if uploaded_file is not None:
-    with st.spinner("Transcribing audio..."):
-        # Save the uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
-            temp_file.write(uploaded_file.getvalue())
-            temp_file_path = temp_file.name
-
-        # Transcribe the audio
-        transcription = transcribe_audio(temp_file_path)
-
-        # Remove the temporary file
-        os.unlink(temp_file_path)
-
-        if transcription:
-            st.write("Transcription:", transcription)
-            process_response(transcription)
-            st.rerun()
-        else:
-            st.error("Failed to transcribe the audio. Please try again.")
+    st.experimental_rerun()
 
 # Clear chat button
 if st.button("🗑️ Clear Chat", key="clear", help="Clear all messages"):
     st.session_state.history = []
-    st.session_state.processed_text = None
-    st.rerun()
+    st.experimental_rerun()
 
